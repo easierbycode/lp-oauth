@@ -7,8 +7,9 @@ const TIKTOK_TOKEN_URL = "https://open.tiktokapis.com/v2/oauth/token/";
 const TIKTOK_USER_URL = "https://open.tiktokapis.com/v2/user/info/";
 const REDIRECT_PATH = "/auth/tiktok/callback";
 
-// In-memory session store (MVP only — not persistent across deploys)
+// In-memory stores (MVP only — not persistent across deploys)
 const sessions = new Map<string, { user: TikTokUser; accessToken: string }>();
+const pkceStore = new Map<string, string>(); // state -> code_verifier
 
 interface TikTokUser {
   open_id: string;
@@ -20,6 +21,25 @@ interface TikTokUser {
 
 function generateId(): string {
   return crypto.randomUUID();
+}
+
+function generateCodeVerifier(): string {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  // URL-safe base64 (no padding) — valid verifier per RFC 7636
+  return btoa(String.fromCharCode(...bytes))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+}
+
+async function computeCodeChallenge(verifier: string): Promise<string> {
+  const encoded = new TextEncoder().encode(verifier);
+  const digest = await crypto.subtle.digest("SHA-256", encoded);
+  // TikTok expects hex-encoded SHA-256 (not base64url)
+  return [...new Uint8Array(digest)]
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
 }
 
 function getSessionId(req: Request): string | null {
@@ -135,13 +155,14 @@ function errorPage(message: string): Response {
 
 // ── OAuth helpers ───────────────────────────────────────────────────────────
 
-async function exchangeCode(code: string): Promise<{ accessToken: string; openId: string }> {
+async function exchangeCode(code: string, codeVerifier: string): Promise<{ accessToken: string; openId: string }> {
   const body = new URLSearchParams({
     client_key: TIKTOK_CLIENT_KEY,
     client_secret: TIKTOK_CLIENT_SECRET,
     code,
     grant_type: "authorization_code",
     redirect_uri: `${BASE_URL}${REDIRECT_PATH}`,
+    code_verifier: codeVerifier,
   });
 
   const res = await fetch(TIKTOK_TOKEN_URL, {
@@ -180,14 +201,22 @@ async function fetchUser(accessToken: string): Promise<TikTokUser> {
 
 // ── Route handlers ──────────────────────────────────────────────────────────
 
-function handleAuthStart(): Response {
+async function handleAuthStart(): Promise<Response> {
   const state = generateId();
+  const codeVerifier = generateCodeVerifier();
+  const codeChallenge = await computeCodeChallenge(codeVerifier);
+
+  // Store verifier keyed by state so we can retrieve it in the callback
+  pkceStore.set(state, codeVerifier);
+
   const params = new URLSearchParams({
     client_key: TIKTOK_CLIENT_KEY,
     response_type: "code",
     scope: "user.info.basic,user.info.profile",
     redirect_uri: `${BASE_URL}${REDIRECT_PATH}`,
     state,
+    code_challenge: codeChallenge,
+    code_challenge_method: "S256",
   });
 
   return new Response(null, {
@@ -202,6 +231,7 @@ function handleAuthStart(): Response {
 async function handleCallback(req: Request): Promise<Response> {
   const url = new URL(req.url);
   const code = url.searchParams.get("code");
+  const state = url.searchParams.get("state");
   const error = url.searchParams.get("error");
 
   if (error) {
@@ -213,8 +243,15 @@ async function handleCallback(req: Request): Promise<Response> {
     return errorPage("No authorization code received.");
   }
 
+  // Retrieve and consume the PKCE code_verifier
+  const codeVerifier = state ? pkceStore.get(state) : undefined;
+  if (state) pkceStore.delete(state);
+  if (!codeVerifier) {
+    return errorPage("Missing PKCE code verifier — session may have expired. Please try again.");
+  }
+
   try {
-    const { accessToken } = await exchangeCode(code);
+    const { accessToken } = await exchangeCode(code, codeVerifier);
     const user = await fetchUser(accessToken);
 
     console.dir({ authenticatedUser: user }, { depth: null });
@@ -250,7 +287,7 @@ Deno.serve({ port: 8000 }, async (req: Request): Promise<Response> => {
   const url = new URL(req.url);
   const path = url.pathname;
 
-  if (path === "/auth/tiktok") return handleAuthStart();
+  if (path === "/auth/tiktok") return await handleAuthStart();
   if (path === REDIRECT_PATH) return await handleCallback(req);
   if (path === "/logout") return handleLogout(req);
 
