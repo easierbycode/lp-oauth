@@ -7,6 +7,13 @@ const TIKTOK_TOKEN_URL = "https://open.tiktokapis.com/v2/oauth/token/";
 const TIKTOK_USER_URL = "https://open.tiktokapis.com/v2/user/info/";
 const REDIRECT_PATH = "/auth/tiktok/callback";
 
+// Startup check — logs to Deno Deploy console
+console.log("[startup] ENV check:", {
+  TIKTOK_CLIENT_KEY: TIKTOK_CLIENT_KEY ? `set (${TIKTOK_CLIENT_KEY.length} chars)` : "MISSING",
+  TIKTOK_CLIENT_SECRET: TIKTOK_CLIENT_SECRET ? `set (${TIKTOK_CLIENT_SECRET.length} chars)` : "MISSING",
+  BASE_URL,
+});
+
 // In-memory stores (MVP only — not persistent across deploys)
 const sessions = new Map<string, { user: TikTokUser; accessToken: string }>();
 const pkceStore = new Map<string, string>(); // state -> code_verifier
