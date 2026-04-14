@@ -57,13 +57,26 @@ interface Account {
   videosError?: string;
 }
 
+interface Campaign {
+  // Target number of videos to count the campaign as complete. 0 means unset.
+  goal: number;
+  // Video ids (TikTok ids are globally unique across accounts) that the user
+  // has marked as meeting the campaign criteria.
+  includedVideoIds: Set<string>;
+}
+
 interface Session {
   accounts: Account[];
   // open_id of selected account, or "combined"
   selected: string;
+  campaign: Campaign;
 }
 
 const COMBINED = "combined";
+
+function newCampaign(): Campaign {
+  return { goal: 0, includedVideoIds: new Set<string>() };
+}
 
 const sessions = new Map<string, Session>();
 const pkceStore = new Map<string, string>(); // state -> code_verifier
@@ -450,6 +463,71 @@ function renderPage(body: string, layout: "card" | "dashboard" = "card"): Respon
     .btn-logout { background: #e0e0e0; color: #333; padding: 0.55rem 1rem; font-size: 0.9rem; }
     .error { color: #c00; margin-bottom: 1rem; }
     .notice { background: #fff8e1; border: 1px solid #ffe082; color: #795500; padding: 0.75rem 1rem; border-radius: 8px; font-size: 0.9rem; }
+
+    .campaign-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 1rem;
+      flex-wrap: wrap;
+      margin-bottom: 1rem;
+    }
+    .campaign-progress-text {
+      font-size: 0.95rem;
+      color: #444;
+    }
+    .campaign-progress-text strong { color: #111; font-size: 1.15rem; }
+    .campaign-progress-text.complete strong { color: #0a8754; }
+    .progress-bar {
+      height: 10px;
+      background: #eee;
+      border-radius: 999px;
+      overflow: hidden;
+      margin-bottom: 1rem;
+    }
+    .progress-bar-fill {
+      height: 100%;
+      background: linear-gradient(90deg, #fe2c55, #ff6a00);
+      transition: width 0.2s;
+    }
+    .progress-bar-fill.complete { background: #0a8754; }
+    .campaign-controls {
+      display: flex;
+      gap: 0.5rem;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .campaign-controls label {
+      font-size: 0.9rem;
+      color: #555;
+    }
+    .campaign-controls input[type="number"] {
+      width: 90px;
+      padding: 0.45rem 0.6rem;
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      font-size: 0.9rem;
+    }
+    .btn-goal { background: #111; color: #fff; padding: 0.5rem 1rem; font-size: 0.9rem; }
+    .btn-clear { background: #eee; color: #444; padding: 0.5rem 1rem; font-size: 0.85rem; }
+    .campaign-empty { color: #888; font-size: 0.9rem; }
+
+    .video.included { border-color: #fe2c55; box-shadow: 0 0 0 2px #fff0f3 inset; }
+    .video-include {
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+      padding: 0.45rem 0.6rem;
+      border-top: 1px solid #eee;
+      background: #fff;
+      font-size: 0.8rem;
+      color: #555;
+      cursor: pointer;
+      user-select: none;
+    }
+    .video-include input { margin: 0; cursor: pointer; }
+    .video-include.checked { background: #fff0f3; color: #b3163b; font-weight: 600; }
+    .video-include-form { margin: 0; }
   </style>
 </head>
 <body class="layout-${layout}">
@@ -525,7 +603,71 @@ function renderStatsPanel(user: TikTokUser): string {
   `;
 }
 
-function renderVideosPanel(videos: TikTokVideo[], error?: string): string {
+function renderCampaignPanel(session: Session, visibleVideos: TikTokVideo[]): string {
+  const { goal, includedVideoIds } = session.campaign;
+  const includedCount = includedVideoIds.size;
+
+  // Count how many of the included videos are currently visible in this view —
+  // e.g. in single-account view, included videos from other accounts still
+  // count toward the overall campaign total, but this gives helpful context.
+  const includedVisible = visibleVideos.filter((v) =>
+    includedVideoIds.has(v.id)
+  ).length;
+
+  const pct =
+    goal > 0 ? Math.min(100, Math.round((includedCount / goal) * 100)) : 0;
+  const complete = goal > 0 && includedCount >= goal;
+
+  const progress =
+    goal > 0
+      ? `
+        <div class="campaign-progress-text ${complete ? "complete" : ""}">
+          <strong>${includedCount} / ${goal}</strong> videos included${
+            complete ? " · goal reached!" : ""
+          }
+          ${
+            visibleVideos.length && includedVisible !== includedCount
+              ? ` <span style="color:#888">(${includedVisible} in current view)</span>`
+              : ""
+          }
+        </div>
+        <div class="progress-bar">
+          <div class="progress-bar-fill ${complete ? "complete" : ""}" style="width:${pct}%"></div>
+        </div>`
+      : `<div class="campaign-empty">No goal set yet. Enter a target number of videos below to start tracking.</div>`;
+
+  const clearForm =
+    goal > 0 || includedCount > 0
+      ? `
+        <form method="post" action="/campaign/clear" style="margin:0">
+          <button type="submit" class="btn btn-clear">Reset campaign</button>
+        </form>`
+      : "";
+
+  return `
+    <div class="panel">
+      <div class="campaign-header">
+        <h2>Campaign goal</h2>
+      </div>
+      ${progress}
+      <div class="campaign-controls">
+        <form method="post" action="/campaign/goal" class="campaign-controls" style="margin:0">
+          <label for="goal-input">Target videos:</label>
+          <input id="goal-input" type="number" name="goal" min="0" step="1"
+                 value="${goal || ""}" placeholder="e.g. 10" />
+          <button type="submit" class="btn btn-goal">${goal > 0 ? "Update" : "Set goal"}</button>
+        </form>
+        ${clearForm}
+      </div>
+    </div>
+  `;
+}
+
+function renderVideosPanel(
+  videos: TikTokVideo[],
+  includedVideoIds: Set<string>,
+  error?: string,
+): string {
   if (error) {
     return `
       <div class="panel">
@@ -553,8 +695,19 @@ function renderVideosPanel(videos: TikTokVideo[], error?: string): string {
       const titleEl = href
         ? `<a class="video-title" href="${escapeHtml(href)}" target="_blank" rel="noopener">${title}</a>`
         : `<div class="video-title">${title}</div>`;
+      const included = includedVideoIds.has(v.id);
+      const toggle = `
+        <form method="post" action="/campaign/toggle" class="video-include-form">
+          <input type="hidden" name="video_id" value="${escapeHtml(v.id)}" />
+          <label class="video-include ${included ? "checked" : ""}">
+            <input type="checkbox" ${included ? "checked" : ""}
+                   onchange="this.form.submit()" />
+            <span>${included ? "Included in campaign" : "Include in campaign"}</span>
+          </label>
+          <noscript><button type="submit" class="btn btn-clear" style="width:100%;border-radius:0">${included ? "Remove" : "Include"}</button></noscript>
+        </form>`;
       return `
-        <article class="video">
+        <article class="video ${included ? "included" : ""}">
           <div class="video-cover">
             ${cover}
             <span class="video-duration">${formatDuration(v.duration)}</span>
@@ -569,13 +722,19 @@ function renderVideosPanel(videos: TikTokVideo[], error?: string): string {
               <span class="video-stat">↗ ${formatCount(v.share_count)}</span>
             </div>
           </div>
+          ${toggle}
         </article>`;
     })
     .join("");
 
+  const includedCount = videos.filter((v) => includedVideoIds.has(v.id)).length;
+  const heading = includedCount > 0
+    ? `Videos (${videos.length}) · <span style="color:#fe2c55">${includedCount} included</span>`
+    : `Videos (${videos.length})`;
+
   return `
     <div class="panel">
-      <h2>Videos (${videos.length})</h2>
+      <h2>${heading}</h2>
       <div class="video-grid">${cards}</div>
     </div>
   `;
@@ -700,6 +859,9 @@ function userPage(session: Session): Response {
   let profilePanel: string;
   let statsPanel: string;
   let videosPanel: string;
+  let visibleVideos: TikTokVideo[];
+
+  const included = session.campaign.includedVideoIds;
 
   if (showCombined) {
     heading = `Combined (${session.accounts.length} accounts)`;
@@ -707,14 +869,14 @@ function userPage(session: Session): Response {
     statsPanel = renderCombinedStatsPanel(session.accounts);
 
     // Merge videos from all accounts; newest first.
-    const allVideos = session.accounts
+    visibleVideos = session.accounts
       .flatMap((acc) => acc.videos)
       .sort((a, b) => (b.create_time ?? 0) - (a.create_time ?? 0));
     const mergedErrors = session.accounts
       .map((acc) => acc.videosError)
       .filter((e): e is string => !!e);
     const combinedError = mergedErrors.length ? mergedErrors.join("; ") : undefined;
-    videosPanel = renderVideosPanel(allVideos, combinedError);
+    videosPanel = renderVideosPanel(visibleVideos, included, combinedError);
   } else {
     const active =
       session.accounts.find((a) => a.user.open_id === session.selected) ??
@@ -722,8 +884,11 @@ function userPage(session: Session): Response {
     heading = `Welcome, ${escapeHtml(active.user.display_name ?? "friend")}!`;
     profilePanel = renderProfilePanel(active.user);
     statsPanel = renderStatsPanel(active.user);
-    videosPanel = renderVideosPanel(active.videos, active.videosError);
+    visibleVideos = active.videos;
+    videosPanel = renderVideosPanel(visibleVideos, included, active.videosError);
   }
+
+  const campaignPanel = renderCampaignPanel(session, visibleVideos);
 
   const body = `
     <div class="topbar">
@@ -738,6 +903,7 @@ function userPage(session: Session): Response {
     </div>
     ${profilePanel}
     ${statsPanel}
+    ${campaignPanel}
     ${videosPanel}
   `;
   return renderPage(body, "dashboard");
@@ -912,6 +1078,7 @@ async function handleCallback(req: Request): Promise<Response> {
       sessions.set(sessionId, {
         accounts: [newAccount],
         selected: user.open_id,
+        campaign: newCampaign(),
       });
     }
 
@@ -940,6 +1107,94 @@ function handleLogout(req: Request): Response {
       "set-cookie": clearSessionCookie(),
     },
   });
+}
+
+// ── Campaign goal tracking ──────────────────────────────────────────────────
+//
+// Campaign state lives on the session and lets the signed-in user:
+//   • Set a target number of videos for the campaign.
+//   • Mark individual videos (across any of their connected accounts) as
+//     meeting the campaign's inclusion criteria.
+// Progress is then rendered as `<included> / <goal>` on the dashboard.
+
+function requireSession(req: Request): Session | null {
+  const sessionId = getSessionId(req);
+  return sessionId ? sessions.get(sessionId) ?? null : null;
+}
+
+function ensureCampaign(session: Session): Campaign {
+  // Defensive: older sessions (pre-feature) may lack a campaign field.
+  if (!session.campaign) session.campaign = newCampaign();
+  return session.campaign;
+}
+
+function redirectHome(): Response {
+  return new Response(null, { status: 303, headers: { location: "/" } });
+}
+
+async function handleCampaignGoal(req: Request): Promise<Response> {
+  if (req.method !== "POST") {
+    return new Response("Method not allowed", {
+      status: 405,
+      headers: { allow: "POST" },
+    });
+  }
+  const session = requireSession(req);
+  if (!session) return redirectHome();
+
+  const form = await req.formData();
+  const raw = form.get("goal");
+  const parsed = Number(typeof raw === "string" ? raw : "");
+  const goal = Number.isFinite(parsed) && parsed >= 0
+    ? Math.floor(parsed)
+    : 0;
+
+  ensureCampaign(session).goal = goal;
+  return redirectHome();
+}
+
+async function handleCampaignToggle(req: Request): Promise<Response> {
+  if (req.method !== "POST") {
+    return new Response("Method not allowed", {
+      status: 405,
+      headers: { allow: "POST" },
+    });
+  }
+  const session = requireSession(req);
+  if (!session) return redirectHome();
+
+  const form = await req.formData();
+  const videoId = form.get("video_id");
+  if (typeof videoId !== "string" || !videoId) return redirectHome();
+
+  // Only allow toggling videos that actually belong to this session's accounts,
+  // so a stray request can't inflate the progress counter.
+  const known = session.accounts.some((acc) =>
+    acc.videos.some((v) => v.id === videoId)
+  );
+  if (!known) return redirectHome();
+
+  const campaign = ensureCampaign(session);
+  if (campaign.includedVideoIds.has(videoId)) {
+    campaign.includedVideoIds.delete(videoId);
+  } else {
+    campaign.includedVideoIds.add(videoId);
+  }
+  return redirectHome();
+}
+
+function handleCampaignClear(req: Request): Response {
+  if (req.method !== "POST") {
+    return new Response("Method not allowed", {
+      status: 405,
+      headers: { allow: "POST" },
+    });
+  }
+  const session = requireSession(req);
+  if (!session) return redirectHome();
+
+  session.campaign = newCampaign();
+  return redirectHome();
 }
 
 // ── Webhook handler ─────────────────────────────────────────────────────────
@@ -1164,6 +1419,9 @@ Deno.serve({ port: 8000 }, async (req: Request): Promise<Response> => {
   if (path === REDIRECT_PATH) return await handleCallback(req);
   if (path === WEBHOOK_PATH) return await handleWebhook(req);
   if (path === "/logout") return handleLogout(req);
+  if (path === "/campaign/goal") return await handleCampaignGoal(req);
+  if (path === "/campaign/toggle") return await handleCampaignToggle(req);
+  if (path === "/campaign/clear") return handleCampaignClear(req);
 
   // Home — show user page if session exists, otherwise sign-in.
   // Supports ?account=<open_id|combined> to toggle the active view.
@@ -1171,6 +1429,7 @@ Deno.serve({ port: 8000 }, async (req: Request): Promise<Response> => {
     const sessionId = getSessionId(req);
     const session = sessionId ? sessions.get(sessionId) : null;
     if (!session) return homePage();
+    ensureCampaign(session);
 
     const requested = url.searchParams.get("account");
     if (requested) {
