@@ -45,10 +45,22 @@ const VIDEO_FIELDS = [
 ].join(",");
 
 // In-memory stores (MVP only — not persistent across deploys)
-const sessions = new Map<
-  string,
-  { user: TikTokUser; videos: TikTokVideo[]; accessToken: string }
->();
+interface Account {
+  user: TikTokUser;
+  videos: TikTokVideo[];
+  accessToken: string;
+  videosError?: string;
+}
+
+interface Session {
+  accounts: Account[];
+  // open_id of selected account, or "combined"
+  selected: string;
+}
+
+const COMBINED = "combined";
+
+const sessions = new Map<string, Session>();
 const pkceStore = new Map<string, string>(); // state -> code_verifier
 
 interface TikTokUser {
@@ -333,8 +345,88 @@ function renderPage(body: string, layout: "card" | "dashboard" = "card"): Respon
       justify-content: space-between;
       align-items: center;
       margin-bottom: 0.5rem;
+      gap: 1rem;
+      flex-wrap: wrap;
     }
     .topbar h1 { margin: 0; }
+    .topbar-actions { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+
+    .account-selector {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+      align-items: center;
+    }
+    .account-option {
+      position: relative;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.5rem 0.85rem;
+      border: 2px solid #e5e5e5;
+      border-radius: 999px;
+      background: #fff;
+      cursor: pointer;
+      font-size: 0.9rem;
+      font-weight: 500;
+      color: #444;
+      transition: border-color 0.15s, background 0.15s;
+    }
+    .account-option:hover { border-color: #ccc; }
+    .account-option input { position: absolute; opacity: 0; pointer-events: none; }
+    .account-option input:checked ~ .account-option-body {
+      color: #000;
+    }
+    .account-option:has(input:checked) {
+      border-color: #fe2c55;
+      background: #fff0f3;
+      color: #000;
+    }
+    .account-option .account-avatar {
+      width: 24px;
+      height: 24px;
+      border-radius: 50%;
+      background: #eee;
+      object-fit: cover;
+      display: block;
+      flex-shrink: 0;
+    }
+    .account-option.combined {
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      font-size: 0.78rem;
+      font-weight: 700;
+    }
+    .account-option.combined::before {
+      content: "∑";
+      font-size: 1rem;
+      font-weight: 700;
+    }
+
+    .combined-profiles {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+      gap: 0.75rem;
+    }
+    .combined-profile {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      padding: 0.75rem;
+      background: #fafafa;
+      border: 1px solid #eee;
+      border-radius: 10px;
+    }
+    .combined-profile .avatar-xs {
+      width: 44px;
+      height: 44px;
+      border-radius: 50%;
+      background: #eee;
+      object-fit: cover;
+      flex-shrink: 0;
+    }
+    .combined-profile-name { font-weight: 600; font-size: 0.95rem; color: #111; }
+    .combined-profile-username { font-size: 0.8rem; color: #888; }
 
     .btn {
       display: inline-block;
@@ -349,7 +441,8 @@ function renderPage(body: string, layout: "card" | "dashboard" = "card"): Respon
     }
     .btn:hover { opacity: 0.85; }
     .btn-tiktok { background: #000; color: #fff; padding: 0.75rem 2rem; font-size: 1rem; }
-    .btn-logout { background: #e0e0e0; color: #333; }
+    .btn-add { background: #fe2c55; color: #fff; padding: 0.55rem 1rem; font-size: 0.9rem; }
+    .btn-logout { background: #e0e0e0; color: #333; padding: 0.55rem 1rem; font-size: 0.9rem; }
     .error { color: #c00; margin-bottom: 1rem; }
     .notice { background: #fff8e1; border: 1px solid #ffe082; color: #795500; padding: 0.75rem 1rem; border-radius: 8px; font-size: 0.9rem; }
   </style>
@@ -483,19 +576,164 @@ function renderVideosPanel(videos: TikTokVideo[], error?: string): string {
   `;
 }
 
-function userPage(
-  user: TikTokUser,
-  videos: TikTokVideo[],
-  videosError?: string,
-): Response {
+function renderAccountSelector(session: Session): string {
+  const showCombined = session.accounts.length >= 2;
+
+  const accountOptions = session.accounts
+    .map((acc) => {
+      const { open_id, display_name, username, avatar_url_100, avatar_url } = acc.user;
+      const avatarSrc = avatar_url_100 ?? avatar_url;
+      const avatar = avatarSrc
+        ? `<img class="account-avatar" src="${escapeHtml(avatarSrc)}" alt="" />`
+        : `<span class="account-avatar"></span>`;
+      const label = escapeHtml(display_name ?? username ?? open_id.slice(0, 8));
+      const checked = session.selected === open_id ? "checked" : "";
+      return `
+        <label class="account-option">
+          <input type="radio" name="account" value="${escapeHtml(open_id)}" ${checked}
+                 onchange="this.form.submit()" />
+          ${avatar}
+          <span class="account-option-body">${label}</span>
+        </label>`;
+    })
+    .join("");
+
+  const combinedOption = showCombined
+    ? `
+      <label class="account-option combined">
+        <input type="radio" name="account" value="${COMBINED}"
+               ${session.selected === COMBINED ? "checked" : ""}
+               onchange="this.form.submit()" />
+        <span class="account-option-body">Combined</span>
+      </label>`
+    : "";
+
+  return `
+    <form method="get" action="/" class="account-selector">
+      ${accountOptions}
+      ${combinedOption}
+      <noscript><button type="submit" class="btn btn-add">Switch</button></noscript>
+    </form>
+  `;
+}
+
+function renderCombinedProfilePanel(accounts: Account[]): string {
+  const cards = accounts
+    .map((acc) => {
+      const { display_name, username, avatar_url_100, avatar_url } = acc.user;
+      const avatarSrc = avatar_url_100 ?? avatar_url;
+      const avatar = avatarSrc
+        ? `<img class="avatar-xs" src="${escapeHtml(avatarSrc)}" alt="" />`
+        : `<div class="avatar-xs"></div>`;
+      const link = acc.user.profile_deep_link
+        ? `<a class="profile-link" href="${escapeHtml(acc.user.profile_deep_link)}" target="_blank" rel="noopener">View →</a>`
+        : "";
+      return `
+        <div class="combined-profile">
+          ${avatar}
+          <div>
+            <div class="combined-profile-name">${escapeHtml(display_name ?? "Unknown")}</div>
+            ${username ? `<div class="combined-profile-username">@${escapeHtml(username)}</div>` : ""}
+            ${link}
+          </div>
+        </div>`;
+    })
+    .join("");
+
+  return `
+    <div class="panel">
+      <h2>Combined view · ${accounts.length} accounts</h2>
+      <div class="combined-profiles">${cards}</div>
+    </div>
+  `;
+}
+
+function sumField(
+  accounts: Account[],
+  field: keyof TikTokUser,
+): number | undefined {
+  let total = 0;
+  let anyDefined = false;
+  for (const acc of accounts) {
+    const v = acc.user[field];
+    if (typeof v === "number") {
+      total += v;
+      anyDefined = true;
+    }
+  }
+  return anyDefined ? total : undefined;
+}
+
+function renderCombinedStatsPanel(accounts: Account[]): string {
+  const stats: Array<[string, number | undefined]> = [
+    ["Followers", sumField(accounts, "follower_count")],
+    ["Following", sumField(accounts, "following_count")],
+    ["Likes", sumField(accounts, "likes_count")],
+    ["Videos", sumField(accounts, "video_count")],
+  ];
+  const cells = stats
+    .map(
+      ([label, value]) => `
+        <div class="stat">
+          <div class="stat-value">${formatCount(value)}</div>
+          <div class="stat-label">${label}</div>
+        </div>`,
+    )
+    .join("");
+  return `
+    <div class="panel">
+      <h2>Combined stats</h2>
+      <div class="stats-grid">${cells}</div>
+    </div>
+  `;
+}
+
+function userPage(session: Session): Response {
+  const showCombined = session.selected === COMBINED && session.accounts.length >= 2;
+
+  let heading: string;
+  let profilePanel: string;
+  let statsPanel: string;
+  let videosPanel: string;
+
+  if (showCombined) {
+    heading = `Combined (${session.accounts.length} accounts)`;
+    profilePanel = renderCombinedProfilePanel(session.accounts);
+    statsPanel = renderCombinedStatsPanel(session.accounts);
+
+    // Merge videos from all accounts; newest first.
+    const allVideos = session.accounts
+      .flatMap((acc) => acc.videos)
+      .sort((a, b) => (b.create_time ?? 0) - (a.create_time ?? 0));
+    const mergedErrors = session.accounts
+      .map((acc) => acc.videosError)
+      .filter((e): e is string => !!e);
+    const combinedError = mergedErrors.length ? mergedErrors.join("; ") : undefined;
+    videosPanel = renderVideosPanel(allVideos, combinedError);
+  } else {
+    const active =
+      session.accounts.find((a) => a.user.open_id === session.selected) ??
+      session.accounts[0];
+    heading = `Welcome, ${escapeHtml(active.user.display_name ?? "friend")}!`;
+    profilePanel = renderProfilePanel(active.user);
+    statsPanel = renderStatsPanel(active.user);
+    videosPanel = renderVideosPanel(active.videos, active.videosError);
+  }
+
   const body = `
     <div class="topbar">
-      <h1>Welcome, ${escapeHtml(user.display_name ?? "friend")}!</h1>
-      <a class="btn btn-logout" href="/logout">Sign out</a>
+      <h1>${heading}</h1>
+      <div class="topbar-actions">
+        <a class="btn btn-add" href="/auth/tiktok">+ Add TikTok Account</a>
+        <a class="btn btn-logout" href="/logout">Sign out</a>
+      </div>
     </div>
-    ${renderProfilePanel(user)}
-    ${renderStatsPanel(user)}
-    ${renderVideosPanel(videos, videosError)}
+    <div class="panel">
+      ${renderAccountSelector(session)}
+    </div>
+    ${profilePanel}
+    ${statsPanel}
+    ${videosPanel}
   `;
   return renderPage(body, "dashboard");
 }
@@ -642,12 +880,44 @@ async function handleCallback(req: Request): Promise<Response> {
 
     console.dir({ authenticatedUser: user, videoCount: videos.length }, { depth: null });
 
-    const sessionId = generateId();
-    sessions.set(sessionId, { user, videos, accessToken });
+    const newAccount: Account = { user, videos, accessToken, videosError };
 
-    const page = userPage(user, videos, videosError);
-    page.headers.set("set-cookie", setSessionCookie(sessionId));
-    return page;
+    // If an existing session cookie points to a live session, append the
+    // new account instead of starting a new session. Re-connecting the same
+    // TikTok account (same open_id) replaces the prior entry so tokens refresh.
+    const existingSessionId = getSessionId(req);
+    const existingSession = existingSessionId
+      ? sessions.get(existingSessionId)
+      : null;
+
+    let sessionId: string;
+    if (existingSessionId && existingSession) {
+      sessionId = existingSessionId;
+      const dupIndex = existingSession.accounts.findIndex(
+        (a) => a.user.open_id === user.open_id,
+      );
+      if (dupIndex >= 0) {
+        existingSession.accounts[dupIndex] = newAccount;
+      } else {
+        existingSession.accounts.push(newAccount);
+      }
+      existingSession.selected = user.open_id;
+    } else {
+      sessionId = generateId();
+      sessions.set(sessionId, {
+        accounts: [newAccount],
+        selected: user.open_id,
+      });
+    }
+
+    // PRG: redirect to "/" so refresh doesn't replay the callback.
+    return new Response(null, {
+      status: 302,
+      headers: {
+        location: "/",
+        "set-cookie": setSessionCookie(sessionId),
+      },
+    });
   } catch (err) {
     console.error("OAuth callback error:", err);
     return errorPage(err instanceof Error ? err.message : "Authentication failed.");
@@ -677,12 +947,32 @@ Deno.serve({ port: 8000 }, async (req: Request): Promise<Response> => {
   if (path === REDIRECT_PATH) return await handleCallback(req);
   if (path === "/logout") return handleLogout(req);
 
-  // Home — show user page if session exists, otherwise sign-in
+  // Home — show user page if session exists, otherwise sign-in.
+  // Supports ?account=<open_id|combined> to toggle the active view.
   if (path === "/") {
     const sessionId = getSessionId(req);
     const session = sessionId ? sessions.get(sessionId) : null;
-    if (session) return userPage(session.user, session.videos);
-    return homePage();
+    if (!session) return homePage();
+
+    const requested = url.searchParams.get("account");
+    if (requested) {
+      const isCombined =
+        requested === COMBINED && session.accounts.length >= 2;
+      const matchesAccount = session.accounts.some(
+        (a) => a.user.open_id === requested,
+      );
+      if (isCombined || matchesAccount) {
+        session.selected = requested;
+        // Redirect to clean URL so the selection is reflected without the
+        // query param lingering on refresh.
+        return new Response(null, {
+          status: 302,
+          headers: { location: "/" },
+        });
+      }
+    }
+
+    return userPage(session);
   }
 
   return new Response("Not found", { status: 404 });
