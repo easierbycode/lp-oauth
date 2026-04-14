@@ -7,6 +7,11 @@ const TIKTOK_TOKEN_URL = "https://open.tiktokapis.com/v2/oauth/token/";
 const TIKTOK_USER_URL = "https://open.tiktokapis.com/v2/user/info/";
 const TIKTOK_VIDEO_LIST_URL = "https://open.tiktokapis.com/v2/video/list/";
 const REDIRECT_PATH = "/auth/tiktok/callback";
+const WEBHOOK_PATH = "/webhooks/tiktok";
+
+// Reject webhook payloads whose signed timestamp is older than this, to mitigate
+// replay attacks. TikTok's recommended tolerance is on the order of minutes.
+const WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS = 5 * 60;
 
 // Fields returned from user/info/, grouped by required scope.
 const USER_FIELDS = [
@@ -937,6 +942,218 @@ function handleLogout(req: Request): Response {
   });
 }
 
+// ── Webhook handler ─────────────────────────────────────────────────────────
+//
+// TikTok delivers real-time event notifications to a registered callback URL
+// via HTTPS POST. The request includes a `TikTok-Signature` header of the form
+// `t=<unix_timestamp>,s=<hex_hmac_sha256>` where the signature is computed as
+// HMAC-SHA256(client_secret, `<timestamp>.<raw_body>`).
+//
+// We must:
+//   1. Respond 200 quickly (TikTok retries for 72h on non-2xx).
+//   2. Verify the signature in constant time and reject stale timestamps.
+//   3. Treat delivery as at-least-once and handle duplicates idempotently.
+//
+// See: https://developers.tiktok.com/doc/webhooks-overview
+
+interface TikTokWebhookEvent {
+  client_key: string;
+  event: string;
+  create_time: number;
+  user_openid: string;
+  // `content` is a JSON-serialized string per TikTok's spec.
+  content: string;
+}
+
+// De-duplication ring buffer for at-least-once delivery. Keyed by a stable
+// fingerprint of the event (client_key + event + user_openid + create_time).
+const seenWebhookEvents = new Set<string>();
+const SEEN_EVENTS_LIMIT = 1000;
+
+function rememberWebhookEvent(key: string): boolean {
+  if (seenWebhookEvents.has(key)) return false;
+  if (seenWebhookEvents.size >= SEEN_EVENTS_LIMIT) {
+    // Drop the oldest entry (Set preserves insertion order).
+    const first = seenWebhookEvents.values().next().value;
+    if (first !== undefined) seenWebhookEvents.delete(first);
+  }
+  seenWebhookEvents.add(key);
+  return true;
+}
+
+function parseSignatureHeader(
+  header: string | null,
+): { timestamp: number; signature: string } | null {
+  if (!header) return null;
+  let timestamp: number | undefined;
+  let signature: string | undefined;
+  for (const part of header.split(",")) {
+    const eq = part.indexOf("=");
+    if (eq === -1) continue;
+    const k = part.slice(0, eq).trim();
+    const v = part.slice(eq + 1).trim();
+    if (k === "t") timestamp = Number(v);
+    else if (k === "s") signature = v;
+  }
+  if (!signature || !Number.isFinite(timestamp)) return null;
+  return { timestamp: timestamp as number, signature };
+}
+
+async function computeWebhookSignature(
+  secret: string,
+  timestamp: number,
+  rawBody: string,
+): Promise<string> {
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    "raw",
+    enc.encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const sigBuf = await crypto.subtle.sign(
+    "HMAC",
+    key,
+    enc.encode(`${timestamp}.${rawBody}`),
+  );
+  return [...new Uint8Array(sigBuf)]
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+// Constant-time comparison to avoid leaking signature bytes via timing.
+function timingSafeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) {
+    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return diff === 0;
+}
+
+function removeAccountByOpenId(openId: string): number {
+  let removed = 0;
+  for (const [sessionId, session] of sessions) {
+    const before = session.accounts.length;
+    session.accounts = session.accounts.filter(
+      (a) => a.user.open_id !== openId,
+    );
+    removed += before - session.accounts.length;
+    if (!session.accounts.length) {
+      sessions.delete(sessionId);
+    } else if (session.selected === openId) {
+      session.selected = session.accounts[0].user.open_id;
+    }
+  }
+  return removed;
+}
+
+function handleWebhookEvent(event: TikTokWebhookEvent): void {
+  let parsedContent: unknown = event.content;
+  try {
+    parsedContent = JSON.parse(event.content);
+  } catch {
+    // `content` is documented as a JSON string but tolerate malformed values.
+  }
+
+  console.dir(
+    {
+      tiktokWebhook: {
+        event: event.event,
+        user_openid: event.user_openid,
+        create_time: event.create_time,
+        content: parsedContent,
+      },
+    },
+    { depth: null },
+  );
+
+  switch (event.event) {
+    case "authorization.removed": {
+      // The user's access_token has already been revoked by TikTok. Drop any
+      // in-memory account state so we don't keep trying to use a dead token.
+      const removed = removeAccountByOpenId(event.user_openid);
+      console.log(
+        `[webhook] authorization.removed for ${event.user_openid} — purged ${removed} account(s)`,
+      );
+      break;
+    }
+    default:
+      // Unknown / unsubscribed-by-default event types are still acknowledged
+      // with 200 so TikTok stops retrying. Add explicit handlers as needed.
+      break;
+  }
+}
+
+async function handleWebhook(req: Request): Promise<Response> {
+  if (req.method !== "POST") {
+    return new Response("Method not allowed", {
+      status: 405,
+      headers: { allow: "POST" },
+    });
+  }
+
+  if (!TIKTOK_CLIENT_SECRET) {
+    console.error("[webhook] TIKTOK_CLIENT_SECRET is not configured");
+    return new Response("Server misconfigured", { status: 500 });
+  }
+
+  const rawBody = await req.text();
+  const sig = parseSignatureHeader(req.headers.get("tiktok-signature"));
+  if (!sig) {
+    console.warn("[webhook] missing or malformed TikTok-Signature header");
+    return new Response("Invalid signature", { status: 401 });
+  }
+
+  const expected = await computeWebhookSignature(
+    TIKTOK_CLIENT_SECRET,
+    sig.timestamp,
+    rawBody,
+  );
+  if (!timingSafeEqual(expected, sig.signature)) {
+    console.warn("[webhook] signature mismatch");
+    return new Response("Invalid signature", { status: 401 });
+  }
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  if (Math.abs(nowSec - sig.timestamp) > WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS) {
+    console.warn(
+      `[webhook] stale timestamp: header=${sig.timestamp} now=${nowSec}`,
+    );
+    return new Response("Stale timestamp", { status: 401 });
+  }
+
+  let payload: TikTokWebhookEvent;
+  try {
+    payload = JSON.parse(rawBody) as TikTokWebhookEvent;
+  } catch (err) {
+    console.error("[webhook] invalid JSON body:", err);
+    return new Response("Invalid payload", { status: 400 });
+  }
+
+  if (!payload.event || !payload.client_key) {
+    return new Response("Invalid payload", { status: 400 });
+  }
+
+  // Best-effort defense against the same event being processed twice.
+  const dedupeKey = `${payload.client_key}:${payload.event}:${payload.user_openid}:${payload.create_time}`;
+  if (!rememberWebhookEvent(dedupeKey)) {
+    console.log(`[webhook] duplicate event ignored: ${dedupeKey}`);
+    return new Response("OK", { status: 200 });
+  }
+
+  try {
+    handleWebhookEvent(payload);
+  } catch (err) {
+    // Always 200 once the signature checks out — failures here would just cause
+    // TikTok to redeliver, which won't help an internal logic bug. Log and move on.
+    console.error("[webhook] handler error:", err);
+  }
+
+  return new Response("OK", { status: 200 });
+}
+
 // ── Server ──────────────────────────────────────────────────────────────────
 
 Deno.serve({ port: 8000 }, async (req: Request): Promise<Response> => {
@@ -945,6 +1162,7 @@ Deno.serve({ port: 8000 }, async (req: Request): Promise<Response> => {
 
   if (path === "/auth/tiktok") return await handleAuthStart();
   if (path === REDIRECT_PATH) return await handleCallback(req);
+  if (path === WEBHOOK_PATH) return await handleWebhook(req);
   if (path === "/logout") return handleLogout(req);
 
   // Home — show user page if session exists, otherwise sign-in.
