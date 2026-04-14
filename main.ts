@@ -5,18 +5,85 @@ const BASE_URL = Deno.env.get("BASE_URL") ?? "http://localhost:8000";
 const TIKTOK_AUTH_URL = "https://www.tiktok.com/v2/auth/authorize";
 const TIKTOK_TOKEN_URL = "https://open.tiktokapis.com/v2/oauth/token/";
 const TIKTOK_USER_URL = "https://open.tiktokapis.com/v2/user/info/";
+const TIKTOK_VIDEO_LIST_URL = "https://open.tiktokapis.com/v2/video/list/";
 const REDIRECT_PATH = "/auth/tiktok/callback";
 
+// Fields returned from user/info/, grouped by required scope.
+const USER_FIELDS = [
+  // user.info.basic
+  "open_id",
+  "union_id",
+  "avatar_url",
+  "avatar_url_100",
+  "avatar_large_url",
+  "display_name",
+  // user.info.profile
+  "bio_description",
+  "profile_deep_link",
+  "is_verified",
+  "username",
+  // user.info.stats
+  "follower_count",
+  "following_count",
+  "likes_count",
+  "video_count",
+].join(",");
+
+const VIDEO_FIELDS = [
+  "id",
+  "title",
+  "video_description",
+  "cover_image_url",
+  "share_url",
+  "embed_link",
+  "duration",
+  "create_time",
+  "like_count",
+  "comment_count",
+  "share_count",
+  "view_count",
+].join(",");
+
 // In-memory stores (MVP only — not persistent across deploys)
-const sessions = new Map<string, { user: TikTokUser; accessToken: string }>();
+const sessions = new Map<
+  string,
+  { user: TikTokUser; videos: TikTokVideo[]; accessToken: string }
+>();
 const pkceStore = new Map<string, string>(); // state -> code_verifier
 
 interface TikTokUser {
+  // basic
   open_id: string;
   union_id?: string;
   avatar_url?: string;
+  avatar_url_100?: string;
+  avatar_large_url?: string;
   display_name?: string;
+  // profile
+  bio_description?: string;
+  profile_deep_link?: string;
+  is_verified?: boolean;
   username?: string;
+  // stats
+  follower_count?: number;
+  following_count?: number;
+  likes_count?: number;
+  video_count?: number;
+}
+
+interface TikTokVideo {
+  id: string;
+  title?: string;
+  video_description?: string;
+  cover_image_url?: string;
+  share_url?: string;
+  embed_link?: string;
+  duration?: number;
+  create_time?: number;
+  like_count?: number;
+  comment_count?: number;
+  share_count?: number;
+  view_count?: number;
 }
 
 function generateId(): string {
@@ -58,7 +125,39 @@ function clearSessionCookie(): string {
 
 // ── HTML rendering ──────────────────────────────────────────────────────────
 
-function renderPage(body: string): Response {
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function formatCount(n: number | undefined): string {
+  if (n === undefined || n === null) return "—";
+  if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + "M";
+  if (n >= 1_000) return (n / 1_000).toFixed(1) + "K";
+  return n.toString();
+}
+
+function formatDate(unix: number | undefined): string {
+  if (!unix) return "—";
+  return new Date(unix * 1000).toLocaleDateString(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+  });
+}
+
+function formatDuration(seconds: number | undefined): string {
+  if (!seconds) return "0:00";
+  const m = Math.floor(seconds / 60);
+  const s = Math.floor(seconds % 60);
+  return `${m}:${s.toString().padStart(2, "0")}`;
+}
+
+function renderPage(body: string, layout: "card" | "dashboard" = "card"): Response {
   const html = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -70,11 +169,16 @@ function renderPage(body: string): Response {
     body {
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
       min-height: 100vh;
+      background: #f5f5f5;
+      color: #333;
+    }
+    body.layout-card {
       display: flex;
       align-items: center;
       justify-content: center;
-      background: #f5f5f5;
-      color: #333;
+    }
+    body.layout-dashboard {
+      padding: 2rem 1rem;
     }
     .card {
       background: #fff;
@@ -85,36 +189,173 @@ function renderPage(body: string): Response {
       width: 100%;
       text-align: center;
     }
+    .dashboard {
+      max-width: 960px;
+      margin: 0 auto;
+      display: flex;
+      flex-direction: column;
+      gap: 1.5rem;
+    }
+    .panel {
+      background: #fff;
+      border-radius: 12px;
+      box-shadow: 0 2px 16px rgba(0,0,0,0.08);
+      padding: 2rem;
+    }
     h1 { font-size: 1.5rem; margin-bottom: 1.5rem; }
+    h2 { font-size: 1.15rem; margin-bottom: 1rem; color: #111; }
+    .profile-header {
+      display: flex;
+      align-items: center;
+      gap: 1.25rem;
+      flex-wrap: wrap;
+    }
     .avatar {
+      width: 96px;
+      height: 96px;
+      border-radius: 50%;
+      display: block;
+      flex-shrink: 0;
+      background: #eee;
+    }
+    .avatar-sm {
       width: 80px;
       height: 80px;
-      border-radius: 50%;
       margin: 0 auto 1rem;
+    }
+    .identity { flex: 1; min-width: 200px; }
+    .display-name {
+      font-size: 1.5rem;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+    }
+    .verified {
+      color: #fff;
+      background: #20d5ec;
+      width: 18px;
+      height: 18px;
+      border-radius: 50%;
+      font-size: 12px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 700;
+    }
+    .username { color: #888; font-size: 0.95rem; margin-top: 0.1rem; }
+    .bio { margin-top: 0.75rem; color: #444; line-height: 1.45; white-space: pre-wrap; }
+    .profile-link {
+      display: inline-block;
+      margin-top: 0.75rem;
+      color: #fe2c55;
+      text-decoration: none;
+      font-size: 0.9rem;
+    }
+    .profile-link:hover { text-decoration: underline; }
+    .open-id { color: #aaa; font-size: 0.75rem; word-break: break-all; margin-top: 0.75rem; }
+
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      gap: 1rem;
+    }
+    .stat {
+      background: #fafafa;
+      border: 1px solid #eee;
+      border-radius: 10px;
+      padding: 1rem;
+      text-align: center;
+    }
+    .stat-value { font-size: 1.5rem; font-weight: 700; color: #111; }
+    .stat-label { font-size: 0.85rem; color: #888; margin-top: 0.25rem; text-transform: uppercase; letter-spacing: 0.03em; }
+
+    .video-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+      gap: 1.25rem;
+    }
+    .video {
+      border: 1px solid #eee;
+      border-radius: 10px;
+      overflow: hidden;
+      background: #fafafa;
+      display: flex;
+      flex-direction: column;
+    }
+    .video-cover {
+      position: relative;
+      aspect-ratio: 9 / 16;
+      background: #000;
+      overflow: hidden;
+    }
+    .video-cover img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
       display: block;
     }
-    .username { color: #888; font-size: 0.9rem; margin-bottom: 0.25rem; }
-    .display-name { font-size: 1.25rem; font-weight: 600; margin-bottom: 0.25rem; }
-    .open-id { color: #aaa; font-size: 0.75rem; word-break: break-all; margin-bottom: 1.5rem; }
+    .video-duration {
+      position: absolute;
+      bottom: 6px;
+      right: 6px;
+      background: rgba(0,0,0,0.7);
+      color: #fff;
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-size: 0.75rem;
+    }
+    .video-body { padding: 0.75rem; display: flex; flex-direction: column; gap: 0.4rem; flex: 1; }
+    .video-title {
+      font-size: 0.9rem;
+      font-weight: 600;
+      color: #111;
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+    }
+    .video-date { font-size: 0.75rem; color: #999; }
+    .video-stats {
+      display: flex;
+      gap: 0.75rem;
+      font-size: 0.75rem;
+      color: #666;
+      margin-top: auto;
+      flex-wrap: wrap;
+    }
+    .video-stat { display: inline-flex; gap: 0.2rem; align-items: center; }
+
+    .empty { color: #888; text-align: center; padding: 2rem 0; }
+
+    .topbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 0.5rem;
+    }
+    .topbar h1 { margin: 0; }
+
     .btn {
       display: inline-block;
-      padding: 0.75rem 2rem;
+      padding: 0.6rem 1.4rem;
       border-radius: 8px;
       text-decoration: none;
       font-weight: 600;
-      font-size: 1rem;
+      font-size: 0.95rem;
       cursor: pointer;
       border: none;
       transition: opacity 0.15s;
     }
     .btn:hover { opacity: 0.85; }
-    .btn-tiktok { background: #000; color: #fff; }
-    .btn-logout { background: #e0e0e0; color: #333; margin-top: 1rem; }
+    .btn-tiktok { background: #000; color: #fff; padding: 0.75rem 2rem; font-size: 1rem; }
+    .btn-logout { background: #e0e0e0; color: #333; }
     .error { color: #c00; margin-bottom: 1rem; }
+    .notice { background: #fff8e1; border: 1px solid #ffe082; color: #795500; padding: 0.75rem 1rem; border-radius: 8px; font-size: 0.9rem; }
   </style>
 </head>
-<body>
-  <div class="card">${body}</div>
+<body class="layout-${layout}">
+  ${layout === "dashboard" ? `<div class="dashboard">${body}</div>` : `<div class="card">${body}</div>`}
 </body>
 </html>`;
   return new Response(html, {
@@ -129,26 +370,140 @@ function homePage(): Response {
   `);
 }
 
-function userPage(user: TikTokUser): Response {
-  const avatar = user.avatar_url
-    ? `<img class="avatar" src="${user.avatar_url}" alt="avatar" />`
+function renderProfilePanel(user: TikTokUser): string {
+  const avatarSrc = user.avatar_large_url ?? user.avatar_url ?? user.avatar_url_100;
+  const avatar = avatarSrc
+    ? `<img class="avatar" src="${escapeHtml(avatarSrc)}" alt="avatar" />`
+    : `<div class="avatar"></div>`;
+  const displayName = escapeHtml(user.display_name ?? "Unknown");
+  const verified = user.is_verified ? `<span class="verified" title="Verified">✓</span>` : "";
+  const username = user.username
+    ? `<div class="username">@${escapeHtml(user.username)}</div>`
     : "";
-  const displayName = user.display_name ?? "Unknown";
-  const username = user.username ? `@${user.username}` : "";
-  return renderPage(`
-    <h1>Welcome!</h1>
-    ${avatar}
-    <div class="display-name">${displayName}</div>
-    ${username ? `<div class="username">${username}</div>` : ""}
-    <div class="open-id">ID: ${user.open_id}</div>
-    <a class="btn btn-logout" href="/logout">Sign out</a>
-  `);
+  const bio = user.bio_description
+    ? `<div class="bio">${escapeHtml(user.bio_description)}</div>`
+    : "";
+  const profileLink = user.profile_deep_link
+    ? `<a class="profile-link" href="${escapeHtml(user.profile_deep_link)}" target="_blank" rel="noopener">View on TikTok →</a>`
+    : "";
+
+  return `
+    <div class="panel">
+      <div class="profile-header">
+        ${avatar}
+        <div class="identity">
+          <div class="display-name">${displayName}${verified}</div>
+          ${username}
+          ${bio}
+          ${profileLink}
+          <div class="open-id">open_id: ${escapeHtml(user.open_id)}${user.union_id ? ` · union_id: ${escapeHtml(user.union_id)}` : ""}</div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function renderStatsPanel(user: TikTokUser): string {
+  const stats: Array<[string, number | undefined]> = [
+    ["Followers", user.follower_count],
+    ["Following", user.following_count],
+    ["Likes", user.likes_count],
+    ["Videos", user.video_count],
+  ];
+  const cells = stats
+    .map(
+      ([label, value]) => `
+        <div class="stat">
+          <div class="stat-value">${formatCount(value)}</div>
+          <div class="stat-label">${label}</div>
+        </div>`,
+    )
+    .join("");
+  return `
+    <div class="panel">
+      <h2>Stats</h2>
+      <div class="stats-grid">${cells}</div>
+    </div>
+  `;
+}
+
+function renderVideosPanel(videos: TikTokVideo[], error?: string): string {
+  if (error) {
+    return `
+      <div class="panel">
+        <h2>Videos</h2>
+        <div class="notice">Could not load videos: ${escapeHtml(error)}</div>
+      </div>
+    `;
+  }
+  if (!videos.length) {
+    return `
+      <div class="panel">
+        <h2>Videos</h2>
+        <div class="empty">No videos yet.</div>
+      </div>
+    `;
+  }
+
+  const cards = videos
+    .map((v) => {
+      const cover = v.cover_image_url
+        ? `<img src="${escapeHtml(v.cover_image_url)}" alt="cover" loading="lazy" />`
+        : "";
+      const title = escapeHtml(v.title || v.video_description || "Untitled");
+      const href = v.share_url ?? v.embed_link;
+      const titleEl = href
+        ? `<a class="video-title" href="${escapeHtml(href)}" target="_blank" rel="noopener">${title}</a>`
+        : `<div class="video-title">${title}</div>`;
+      return `
+        <article class="video">
+          <div class="video-cover">
+            ${cover}
+            <span class="video-duration">${formatDuration(v.duration)}</span>
+          </div>
+          <div class="video-body">
+            ${titleEl}
+            <div class="video-date">${formatDate(v.create_time)}</div>
+            <div class="video-stats">
+              <span class="video-stat">▶ ${formatCount(v.view_count)}</span>
+              <span class="video-stat">♥ ${formatCount(v.like_count)}</span>
+              <span class="video-stat">💬 ${formatCount(v.comment_count)}</span>
+              <span class="video-stat">↗ ${formatCount(v.share_count)}</span>
+            </div>
+          </div>
+        </article>`;
+    })
+    .join("");
+
+  return `
+    <div class="panel">
+      <h2>Videos (${videos.length})</h2>
+      <div class="video-grid">${cards}</div>
+    </div>
+  `;
+}
+
+function userPage(
+  user: TikTokUser,
+  videos: TikTokVideo[],
+  videosError?: string,
+): Response {
+  const body = `
+    <div class="topbar">
+      <h1>Welcome, ${escapeHtml(user.display_name ?? "friend")}!</h1>
+      <a class="btn btn-logout" href="/logout">Sign out</a>
+    </div>
+    ${renderProfilePanel(user)}
+    ${renderStatsPanel(user)}
+    ${renderVideosPanel(videos, videosError)}
+  `;
+  return renderPage(body, "dashboard");
 }
 
 function errorPage(message: string): Response {
   return renderPage(`
     <h1>Something went wrong</h1>
-    <p class="error">${message}</p>
+    <p class="error">${escapeHtml(message)}</p>
     <a class="btn btn-tiktok" href="/">Try again</a>
   `);
 }
@@ -182,8 +537,7 @@ async function exchangeCode(code: string, codeVerifier: string): Promise<{ acces
 }
 
 async function fetchUser(accessToken: string): Promise<TikTokUser> {
-  const fields = "open_id,union_id,avatar_url,display_name,username";
-  const url = `${TIKTOK_USER_URL}?fields=${fields}`;
+  const url = `${TIKTOK_USER_URL}?fields=${USER_FIELDS}`;
 
   const res = await fetch(url, {
     headers: { Authorization: `Bearer ${accessToken}` },
@@ -192,11 +546,33 @@ async function fetchUser(accessToken: string): Promise<TikTokUser> {
   const json = await res.json();
   console.dir({ userResponse: json }, { depth: null });
 
-  if (json.error?.code !== "ok" && json.error?.code !== undefined) {
+  if (json.error?.code && json.error.code !== "ok") {
     throw new Error(json.error?.message ?? "Failed to fetch user info");
   }
 
   return json.data.user as TikTokUser;
+}
+
+async function fetchVideos(accessToken: string): Promise<TikTokVideo[]> {
+  const url = `${TIKTOK_VIDEO_LIST_URL}?fields=${VIDEO_FIELDS}`;
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ max_count: 20 }),
+  });
+
+  const json = await res.json();
+  console.dir({ videoListResponse: json }, { depth: null });
+
+  if (json.error?.code && json.error.code !== "ok") {
+    throw new Error(json.error?.message ?? "Failed to fetch videos");
+  }
+
+  return (json.data?.videos ?? []) as TikTokVideo[];
 }
 
 // ── Route handlers ──────────────────────────────────────────────────────────
@@ -212,7 +588,7 @@ async function handleAuthStart(): Promise<Response> {
   const params = new URLSearchParams({
     client_key: TIKTOK_CLIENT_KEY,
     response_type: "code",
-    scope: "user.info.basic,user.info.profile",
+    scope: "user.info.basic,user.info.profile,user.info.stats,video.list",
     redirect_uri: `${BASE_URL}${REDIRECT_PATH}`,
     state,
     code_challenge: codeChallenge,
@@ -254,12 +630,22 @@ async function handleCallback(req: Request): Promise<Response> {
     const { accessToken } = await exchangeCode(code, codeVerifier);
     const user = await fetchUser(accessToken);
 
-    console.dir({ authenticatedUser: user }, { depth: null });
+    // Video list is best-effort — failures shouldn't block sign-in.
+    let videos: TikTokVideo[] = [];
+    let videosError: string | undefined;
+    try {
+      videos = await fetchVideos(accessToken);
+    } catch (err) {
+      videosError = err instanceof Error ? err.message : String(err);
+      console.error("Video list fetch error:", err);
+    }
+
+    console.dir({ authenticatedUser: user, videoCount: videos.length }, { depth: null });
 
     const sessionId = generateId();
-    sessions.set(sessionId, { user, accessToken });
+    sessions.set(sessionId, { user, videos, accessToken });
 
-    const page = userPage(user);
+    const page = userPage(user, videos, videosError);
     page.headers.set("set-cookie", setSessionCookie(sessionId));
     return page;
   } catch (err) {
@@ -295,7 +681,7 @@ Deno.serve({ port: 8000 }, async (req: Request): Promise<Response> => {
   if (path === "/") {
     const sessionId = getSessionId(req);
     const session = sessionId ? sessions.get(sessionId) : null;
-    if (session) return userPage(session.user);
+    if (session) return userPage(session.user, session.videos);
     return homePage();
   }
 
