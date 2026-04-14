@@ -69,7 +69,6 @@ interface Session {
   accounts: Account[];
   // open_id of selected account, or "combined"
   selected: string;
-  campaign: Campaign;
 }
 
 const COMBINED = "combined";
@@ -79,6 +78,11 @@ function newCampaign(): Campaign {
 }
 
 const sessions = new Map<string, Session>();
+// Campaign progress is intentionally stored outside the session so that signing
+// out — or connecting a different TikTok account — doesn't wipe the user's goal
+// and already-included videos. Keyed by a long-lived `campaign_id` cookie so
+// the same campaign follows the browser across logins and across accounts.
+const campaigns = new Map<string, Campaign>();
 const pkceStore = new Map<string, string>(); // state -> code_verifier
 
 interface TikTokUser {
@@ -151,6 +155,20 @@ function setSessionCookie(sessionId: string): string {
 
 function clearSessionCookie(): string {
   return "session_id=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0";
+}
+
+// Campaign cookie outlives the session — that's the whole point. One year
+// so campaigns can span long-running, multi-account efforts without resetting.
+const CAMPAIGN_COOKIE_MAX_AGE = 60 * 60 * 24 * 365;
+
+function getCampaignId(req: Request): string | null {
+  const cookie = req.headers.get("cookie") ?? "";
+  const match = cookie.match(/campaign_id=([^;]+)/);
+  return match ? match[1] : null;
+}
+
+function setCampaignCookie(id: string): string {
+  return `campaign_id=${id}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${CAMPAIGN_COOKIE_MAX_AGE}`;
 }
 
 // ── HTML rendering ──────────────────────────────────────────────────────────
@@ -603,8 +621,8 @@ function renderStatsPanel(user: TikTokUser): string {
   `;
 }
 
-function renderCampaignPanel(session: Session, visibleVideos: TikTokVideo[]): string {
-  const { goal, includedVideoIds } = session.campaign;
+function renderCampaignPanel(campaign: Campaign, visibleVideos: TikTokVideo[]): string {
+  const { goal, includedVideoIds } = campaign;
   const includedCount = includedVideoIds.size;
 
   // Count how many of the included videos are currently visible in this view —
@@ -852,7 +870,7 @@ function renderCombinedStatsPanel(accounts: Account[]): string {
   `;
 }
 
-function userPage(session: Session): Response {
+function userPage(session: Session, campaign: Campaign): Response {
   const showCombined = session.selected === COMBINED && session.accounts.length >= 2;
 
   let heading: string;
@@ -861,7 +879,7 @@ function userPage(session: Session): Response {
   let videosPanel: string;
   let visibleVideos: TikTokVideo[];
 
-  const included = session.campaign.includedVideoIds;
+  const included = campaign.includedVideoIds;
 
   if (showCombined) {
     heading = `Combined (${session.accounts.length} accounts)`;
@@ -888,7 +906,7 @@ function userPage(session: Session): Response {
     videosPanel = renderVideosPanel(visibleVideos, included, active.videosError);
   }
 
-  const campaignPanel = renderCampaignPanel(session, visibleVideos);
+  const campaignPanel = renderCampaignPanel(campaign, visibleVideos);
 
   const body = `
     <div class="topbar">
@@ -1078,18 +1096,21 @@ async function handleCallback(req: Request): Promise<Response> {
       sessions.set(sessionId, {
         accounts: [newAccount],
         selected: user.open_id,
-        campaign: newCampaign(),
       });
     }
 
+    // Carry over the caller's campaign across sign-ins. If they don't have a
+    // `campaign_id` cookie yet, mint one now so the campaign binds to this
+    // browser and survives subsequent logouts + account swaps.
+    const { id: campaignId, created: newCampaignId } = resolveCampaign(req);
+
     // PRG: redirect to "/" so refresh doesn't replay the callback.
-    return new Response(null, {
-      status: 302,
-      headers: {
-        location: "/",
-        "set-cookie": setSessionCookie(sessionId),
-      },
-    });
+    const headers = new Headers({ location: "/" });
+    headers.append("set-cookie", setSessionCookie(sessionId));
+    if (newCampaignId) {
+      headers.append("set-cookie", setCampaignCookie(campaignId));
+    }
+    return new Response(null, { status: 302, headers });
   } catch (err) {
     console.error("OAuth callback error:", err);
     return errorPage(err instanceof Error ? err.message : "Authentication failed.");
@@ -1111,7 +1132,9 @@ function handleLogout(req: Request): Response {
 
 // ── Campaign goal tracking ──────────────────────────────────────────────────
 //
-// Campaign state lives on the session and lets the signed-in user:
+// Campaign state is keyed by a long-lived `campaign_id` cookie rather than the
+// session, so it survives logout and keeps accumulating as the user connects
+// additional TikTok accounts. It lets the signed-in user:
 //   • Set a target number of videos for the campaign.
 //   • Mark individual videos (across any of their connected accounts) as
 //     meeting the campaign's inclusion criteria.
@@ -1122,14 +1145,34 @@ function requireSession(req: Request): Session | null {
   return sessionId ? sessions.get(sessionId) ?? null : null;
 }
 
-function ensureCampaign(session: Session): Campaign {
-  // Defensive: older sessions (pre-feature) may lack a campaign field.
-  if (!session.campaign) session.campaign = newCampaign();
-  return session.campaign;
+function ensureCampaign(campaignId: string): Campaign {
+  let campaign = campaigns.get(campaignId);
+  if (!campaign) {
+    campaign = newCampaign();
+    campaigns.set(campaignId, campaign);
+  }
+  return campaign;
 }
 
-function redirectHome(): Response {
-  return new Response(null, { status: 303, headers: { location: "/" } });
+// Looks up the caller's campaign, minting one on demand. The boolean tells the
+// caller whether we allocated a new id so they can set the cookie on the
+// response. This is the single entry point into the campaigns map so the
+// cookie-keyed lifecycle stays consistent.
+function resolveCampaign(
+  req: Request,
+): { campaign: Campaign; id: string; created: boolean } {
+  const existing = getCampaignId(req);
+  if (existing) {
+    return { campaign: ensureCampaign(existing), id: existing, created: false };
+  }
+  const id = generateId();
+  return { campaign: ensureCampaign(id), id, created: true };
+}
+
+function redirectHome(setCookie?: string): Response {
+  const headers = new Headers({ location: "/" });
+  if (setCookie) headers.append("set-cookie", setCookie);
+  return new Response(null, { status: 303, headers });
 }
 
 async function handleCampaignGoal(req: Request): Promise<Response> {
@@ -1149,8 +1192,11 @@ async function handleCampaignGoal(req: Request): Promise<Response> {
     ? Math.floor(parsed)
     : 0;
 
-  ensureCampaign(session).goal = goal;
-  return redirectHome();
+  const { campaign, id } = resolveCampaign(req);
+  campaign.goal = goal;
+  // Always refresh the cookie so its expiry rolls forward while the user is
+  // actively engaged with their campaign.
+  return redirectHome(setCampaignCookie(id));
 }
 
 async function handleCampaignToggle(req: Request): Promise<Response> {
@@ -1174,13 +1220,13 @@ async function handleCampaignToggle(req: Request): Promise<Response> {
   );
   if (!known) return redirectHome();
 
-  const campaign = ensureCampaign(session);
+  const { campaign, id } = resolveCampaign(req);
   if (campaign.includedVideoIds.has(videoId)) {
     campaign.includedVideoIds.delete(videoId);
   } else {
     campaign.includedVideoIds.add(videoId);
   }
-  return redirectHome();
+  return redirectHome(setCampaignCookie(id));
 }
 
 function handleCampaignClear(req: Request): Response {
@@ -1193,8 +1239,9 @@ function handleCampaignClear(req: Request): Response {
   const session = requireSession(req);
   if (!session) return redirectHome();
 
-  session.campaign = newCampaign();
-  return redirectHome();
+  const { id } = resolveCampaign(req);
+  campaigns.set(id, newCampaign());
+  return redirectHome(setCampaignCookie(id));
 }
 
 // ── Webhook handler ─────────────────────────────────────────────────────────
@@ -1429,7 +1476,9 @@ Deno.serve({ port: 8000 }, async (req: Request): Promise<Response> => {
     const sessionId = getSessionId(req);
     const session = sessionId ? sessions.get(sessionId) : null;
     if (!session) return homePage();
-    ensureCampaign(session);
+
+    const { campaign, id: campaignId, created: newCampaignId } =
+      resolveCampaign(req);
 
     const requested = url.searchParams.get("account");
     if (requested) {
@@ -1442,14 +1491,19 @@ Deno.serve({ port: 8000 }, async (req: Request): Promise<Response> => {
         session.selected = requested;
         // Redirect to clean URL so the selection is reflected without the
         // query param lingering on refresh.
-        return new Response(null, {
-          status: 302,
-          headers: { location: "/" },
-        });
+        const headers = new Headers({ location: "/" });
+        if (newCampaignId) {
+          headers.append("set-cookie", setCampaignCookie(campaignId));
+        }
+        return new Response(null, { status: 302, headers });
       }
     }
 
-    return userPage(session);
+    const response = userPage(session, campaign);
+    if (newCampaignId) {
+      response.headers.append("set-cookie", setCampaignCookie(campaignId));
+    }
+    return response;
   }
 
   return new Response("Not found", { status: 404 });
