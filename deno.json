@@ -1,6 +1,7 @@
 {
   "tasks": {
-    "dev": "deno run --allow-net --allow-env --watch main.ts",
-    "start": "deno run --allow-net --allow-env main.ts"
+    "dev": "deno run --allow-net --allow-env --env-file=.env --watch main.ts",
+    "dev:tunnel": "deno run --allow-net --allow-env --allow-read --allow-write --allow-run=ngrok,deno --env-file=.env dev-tunnel.ts",
+    "start": "deno run --allow-net --allow-env --env-file=.env main.ts"
   }
 }

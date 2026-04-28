@@ -1,5 +1,17 @@
-const TIKTOK_CLIENT_KEY = Deno.env.get("TIKTOK_CLIENT_KEY") ?? "";
-const TIKTOK_CLIENT_SECRET = Deno.env.get("TIKTOK_CLIENT_SECRET") ?? "";
+function requireEnv(name: string): string {
+  const v = Deno.env.get(name);
+  if (!v) {
+    console.error(
+      `Missing required env var: ${name}. ` +
+        `Set it in .env or export it before running \`deno task dev\`.`,
+    );
+    Deno.exit(1);
+  }
+  return v;
+}
+
+const TIKTOK_CLIENT_KEY = requireEnv("TIKTOK_CLIENT_KEY");
+const TIKTOK_CLIENT_SECRET = requireEnv("TIKTOK_CLIENT_SECRET");
 const BASE_URL = Deno.env.get("BASE_URL") ?? "http://localhost:8000";
 
 const TIKTOK_AUTH_URL = "https://www.tiktok.com/v2/auth/authorize";
@@ -83,7 +95,6 @@ const sessions = new Map<string, Session>();
 // and already-included videos. Keyed by a long-lived `campaign_id` cookie so
 // the same campaign follows the browser across logins and across accounts.
 const campaigns = new Map<string, Campaign>();
-const pkceStore = new Map<string, string>(); // state -> code_verifier
 
 interface TikTokUser {
   // basic
@@ -1009,9 +1020,6 @@ async function handleAuthStart(): Promise<Response> {
   const codeVerifier = generateCodeVerifier();
   const codeChallenge = await computeCodeChallenge(codeVerifier);
 
-  // Store verifier keyed by state so we can retrieve it in the callback
-  pkceStore.set(state, codeVerifier);
-
   const params = new URLSearchParams({
     client_key: TIKTOK_CLIENT_KEY,
     response_type: "code",
@@ -1022,11 +1030,15 @@ async function handleAuthStart(): Promise<Response> {
     code_challenge_method: "S256",
   });
 
+  // Stash state + verifier in an HttpOnly cookie so the flow works across
+  // Deno Deploy isolates (which don't share memory). `.` is a safe separator:
+  // state is a UUID, verifier is base64url — neither contains `.`.
   return new Response(null, {
     status: 302,
     headers: {
       location: `${TIKTOK_AUTH_URL}?${params}`,
-      "set-cookie": `oauth_state=${state}; Path=/; HttpOnly; SameSite=Lax; Max-Age=600`,
+      "set-cookie":
+        `oauth_pkce=${state}.${codeVerifier}; Path=/; HttpOnly; SameSite=Lax; Max-Age=600`,
     },
   });
 }
@@ -1046,11 +1058,17 @@ async function handleCallback(req: Request): Promise<Response> {
     return errorPage("No authorization code received.");
   }
 
-  // Retrieve and consume the PKCE code_verifier
-  const codeVerifier = state ? pkceStore.get(state) : undefined;
-  if (state) pkceStore.delete(state);
-  if (!codeVerifier) {
-    return errorPage("Missing PKCE code verifier — session may have expired. Please try again.");
+  // Retrieve and consume the PKCE verifier from the cookie we set in
+  // handleAuthStart. Also validates `state` against the cookie to prevent CSRF.
+  const cookieHeader = req.headers.get("cookie") ?? "";
+  const pkceMatch = cookieHeader.match(/oauth_pkce=([^;]+)/);
+  const [savedState, codeVerifier] = pkceMatch
+    ? pkceMatch[1].split(".", 2)
+    : [undefined, undefined];
+  if (!savedState || !codeVerifier || savedState !== state) {
+    return errorPage(
+      "Missing or mismatched PKCE state — session may have expired. Please try again.",
+    );
   }
 
   try {
@@ -1107,6 +1125,10 @@ async function handleCallback(req: Request): Promise<Response> {
     // PRG: redirect to "/" so refresh doesn't replay the callback.
     const headers = new Headers({ location: "/" });
     headers.append("set-cookie", setSessionCookie(sessionId));
+    headers.append(
+      "set-cookie",
+      "oauth_pkce=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0",
+    );
     if (newCampaignId) {
       headers.append("set-cookie", setCampaignCookie(campaignId));
     }
